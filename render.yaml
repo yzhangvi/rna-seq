@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: rnaseq-deseq-webapp
+    env: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: HOST
+        value: 0.0.0.0

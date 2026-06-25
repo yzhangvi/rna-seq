@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RNA-seq Raw Counts 分析</title>
+    <link rel="stylesheet" href="styles.css?v=20260625-upload-idfix" />
+    <script>
+      if (window.location.protocol === "file:") {
+        window.location.replace("http://127.0.0.1:8788/");
+      }
+    </script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">RNA</div>
+          <div>
+            <h1>Raw Counts 分析</h1>
+            <p>DE / Volcano / Heatmap / GO / KEGG</p>
+          </div>
+        </div>
+
+        <section class="panel">
+          <div class="file-drop" id="dropZone">
+            <span class="file-title" id="fileLabel">拖拽文件到这里，或点击选择</span>
+            <span class="file-meta">可分批追加文件；点击选择时可按 Shift/Cmd 多选</span>
+          </div>
+          <label class="file-picker-button" for="fileInput">选择文件</label>
+          <input id="fileInput" type="file" accept=".xlsx,.xls,.xlsm,.csv,.tsv,.txt" multiple />
+          <div class="file-meta file-helper">如果局域网页面点击拖拽区没有反应，请直接使用上面的系统文件选择按钮。</div>
+          <div class="field">
+            <label for="batchName">File set name</label>
+            <input id="batchName" type="text" placeholder="set1" />
+          </div>
+          <div class="action-row">
+            <button id="addBatchBtn" class="primary">重新加入选择</button>
+            <button id="clearFilesBtn" class="secondary">清空</button>
+          </div>
+          <div id="batchList" class="batch-list"></div>
+          <div class="action-row">
+            <button id="inspectBtn" class="primary">读取队列</button>
+            <button id="demoBtn" class="secondary">示例</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="field-row">
+            <div class="field">
+              <label for="fcCutoff">log2FC</label>
+              <input id="fcCutoff" type="number" min="0" step="0.1" value="1" />
+            </div>
+            <div class="field">
+              <label for="padjCutoff">padj</label>
+              <input id="padjCutoff" type="number" min="0" max="1" step="0.01" value="0.05" />
+            </div>
+          </div>
+          <div class="field species-field">
+            <label for="speciesSelect">GO/KEGG 物种</label>
+            <select id="speciesSelect">
+              <option value="human" selected>Human (org.Hs.eg.db / hsa)</option>
+              <option value="mouse">Mouse (org.Mm.eg.db / mmu)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Gene type filter</label>
+            <div class="mini-actions">
+              <button id="geneTypeAllBtn" class="secondary compact" type="button">全部</button>
+              <button id="geneTypeDefaultBtn" class="secondary compact" type="button">默认</button>
+            </div>
+            <details class="gene-type-picker">
+              <summary id="geneTypeSummary">protein_coding</summary>
+              <div id="geneTypeChecks" class="gene-type-checks"></div>
+            </details>
+          </div>
+          <div class="field">
+            <label for="controlGroup">Control group</label>
+            <select id="controlGroup"></select>
+          </div>
+          <div class="field">
+            <label>KO / treatment contrasts</label>
+            <div id="contrastChecks" class="contrast-checks"></div>
+          </div>
+          <div class="field">
+            <label for="contrastSelect">Volcano / table contrast</label>
+            <select id="contrastSelect"></select>
+          </div>
+        </section>
+
+        <section class="panel sample-panel">
+          <div class="sample-head">
+            <span>Sample</span>
+            <span>Batch</span>
+            <span>Group</span>
+          </div>
+          <div id="sampleGrid" class="sample-grid sample-table"></div>
+        </section>
+
+        <button id="analyzeBtn" class="run-button">运行分析</button>
+        <div id="status" class="status">等待数据</div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div class="metric">
+            <span class="metric-value" id="genesMetric">-</span>
+            <span class="metric-label">Genes</span>
+          </div>
+          <div id="contrastMetrics" class="contrast-metrics"></div>
+          <div class="metric wide">
+            <span class="metric-value small" id="methodMetric">-</span>
+            <span class="metric-label">Method</span>
+          </div>
+          <button id="downloadBtn" class="secondary compact" disabled>导出 Excel</button>
+        </header>
+
+        <nav class="tabs" aria-label="结果视图">
+          <button class="tab active" data-tab="volcano">Volcano</button>
+          <button class="tab" data-tab="heatmap">Heatmap</button>
+          <button class="tab" data-tab="go">GO</button>
+          <button class="tab" data-tab="kegg">KEGG</button>
+          <button class="tab" data-tab="table">结果表</button>
+          <button class="tab" data-tab="code">代码</button>
+        </nav>
+
+        <section id="volcano" class="view active">
+          <div class="chart-panel">
+            <div id="volcanoGallery" class="plot-gallery"></div>
+            <canvas id="volcanoCanvas" class="fallback-canvas" width="1120" height="650"></canvas>
+            <div id="volcanoTip" class="tooltip"></div>
+          </div>
+        </section>
+
+        <section id="heatmap" class="view">
+          <div class="chart-panel">
+            <div id="heatmapGallery" class="plot-gallery"></div>
+            <canvas id="heatmapCanvas" class="fallback-canvas" width="1120" height="720"></canvas>
+          </div>
+        </section>
+
+        <section id="go" class="view">
+          <div class="split-view">
+            <div class="chart-panel">
+              <div id="goGallery" class="plot-gallery"></div>
+              <canvas id="goCanvas" class="fallback-canvas" width="760" height="620"></canvas>
+            </div>
+            <div class="table-panel">
+              <table>
+                <thead>
+                  <tr>
+                    <th>对比</th>
+                    <th>方向</th>
+                    <th>数据库</th>
+                    <th>条目</th>
+                    <th>重叠</th>
+                    <th>padj</th>
+                  </tr>
+                </thead>
+                <tbody id="goBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <section id="kegg" class="view">
+          <div class="split-view">
+            <div class="chart-panel">
+              <div id="keggGallery" class="plot-gallery"></div>
+              <canvas id="keggCanvas" class="fallback-canvas" width="760" height="620"></canvas>
+            </div>
+            <div class="table-panel">
+              <table>
+                <thead>
+                  <tr>
+                    <th>对比</th>
+                    <th>方向</th>
+                    <th>数据库</th>
+                    <th>条目</th>
+                    <th>重叠</th>
+                    <th>padj</th>
+                  </tr>
+                </thead>
+                <tbody id="keggBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <section id="table" class="view">
+          <div class="table-panel full">
+            <table>
+              <thead>
+                <tr>
+                  <th>gene</th>
+                  <th>gene_name</th>
+                  <th>contrast</th>
+                  <th>regulation</th>
+                  <th>baseMean</th>
+                  <th>log2FC</th>
+                  <th>pvalue</th>
+                  <th>padj</th>
+                  <th>dispersion</th>
+                </tr>
+              </thead>
+              <tbody id="resultBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="code" class="view">
+          <div class="code-panel">
+            <div class="code-actions">
+              <button id="codeAllBtn" class="secondary compact" type="button">显示全部</button>
+              <button id="codeNoneBtn" class="secondary compact" type="button">全部隐藏</button>
+              <label><input type="checkbox" name="codeModule" value="deseq" checked /> DESeq2</label>
+              <label><input type="checkbox" name="codeModule" value="volcano" checked /> Volcano</label>
+              <label><input type="checkbox" name="codeModule" value="heatmap" checked /> Heatmap</label>
+              <label><input type="checkbox" name="codeModule" value="kegg" checked /> KEGG</label>
+              <label><input type="checkbox" name="codeModule" value="go" checked /> GO</label>
+              <button id="applyCodeBtn" class="primary compact">刷新代码</button>
+              <button id="resetCodeBtn" class="secondary compact">恢复默认参数</button>
+            </div>
+            <div class="color-options">
+              <label>UP <input id="colorUp" type="color" value="#D62728" /></label>
+              <label>DOWN <input id="colorDown" type="color" value="#1F77B4" /></label>
+              <label>NS <input id="colorNs" type="color" value="#B3B3B3" /></label>
+              <label>Heat high <input id="colorHeatHigh" type="color" value="#D62728" /></label>
+              <label>Heat mid <input id="colorHeatMid" type="color" value="#F8FAFC" /></label>
+              <label>Heat low <input id="colorHeatLow" type="color" value="#1F77B4" /></label>
+              <label>Group 1 <input id="colorGroup1" type="color" value="#4D4D4D" /></label>
+              <label>Group 2 <input id="colorGroup2" type="color" value="#D62728" /></label>
+              <label>Group 3 <input id="colorGroup3" type="color" value="#1F77B4" /></label>
+            </div>
+            <textarea id="analysisCode" spellcheck="false" readonly></textarea>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script src="app.js?v=20260625-upload-idfix"></script>
+  </body>
+</html>
