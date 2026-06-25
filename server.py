@@ -1130,7 +1130,21 @@ class AppHandler(SimpleHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         print(format % args)
 
+    def end_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Max-Age", "86400")
+        super().end_headers()
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self.end_headers()
+
     def do_GET(self) -> None:
+        if self.path == "/api/health":
+            json_response(self, {"ok": True, "service": "rnaseq-deseq-webapp"})
+            return
         if self.path == "/api/demo":
             try:
                 json_response(self, demo_payload())

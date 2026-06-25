@@ -37,6 +37,12 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+const API_BASE = String(window.RNASEQ_API_BASE || localStorage.getItem("rnaseqApiBase") || "").replace(/\/$/, "");
+
+function apiUrl(path) {
+  return `${API_BASE}${path}`;
+}
+
 function makeId() {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID();
   return `id_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
@@ -696,7 +702,15 @@ function formDataWithBatches(extra = {}) {
 }
 
 async function apiPost(path, form) {
-  const response = await fetch(path, { method: "POST", body: form });
+  let response;
+  try {
+    response = await fetch(apiUrl(path), { method: "POST", body: form });
+  } catch (error) {
+    const hint = API_BASE
+      ? `无法连接后端 ${API_BASE}。请确认后端服务在线，且已经允许跨域访问。`
+      : "无法连接后端 API。请确认公网部署不是纯静态网页，并且前端和 Python/R 后端部署在同一个服务里。";
+    throw new Error(`${hint} 浏览器原始错误：${error.message}`);
+  }
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.includes("application/json")) {
     const text = await response.text();
@@ -994,7 +1008,7 @@ async function analyzeFiles() {
 async function loadDemo() {
   try {
     setStatus("加载多 KO 示例...");
-    const response = await fetch("/api/demo");
+    const response = await fetch(apiUrl("/api/demo"));
     const payload = await response.json();
     if (!payload.ok) throw new Error(payload.error || "示例数据加载失败。");
     renderResults(payload);
@@ -1444,7 +1458,7 @@ function renderResultTable() {
 
 async function downloadExcel() {
   if (!state.results?.contrasts?.length) return;
-  const response = await fetch("/api/export_deseq", {
+  const response = await fetch(apiUrl("/api/export_deseq"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(state.results),
@@ -1604,12 +1618,26 @@ function wireEvents() {
   document.querySelectorAll(".tab").forEach((button) => button.addEventListener("click", switchTab));
 }
 
+async function checkBackendHealth() {
+  try {
+    const response = await fetch(apiUrl("/api/health"), { method: "GET" });
+    const payload = await response.json();
+    if (!payload.ok) throw new Error("health check failed");
+  } catch (error) {
+    const message = API_BASE
+      ? `后端 ${API_BASE} 暂时无法连接，读取队列会失败。`
+      : "后端 API 暂时无法连接。如果这是公网部署，请确认不是只部署了静态网页，而是部署了包含 Python/R 的 Docker Web Service。";
+    setStatus(message, "error");
+  }
+}
+
 bindUploadEvents();
 try {
   renderGeneTypeControls();
   syncRecipeInputs();
   $("analysisCode").value = analysisCodeText();
   wireEvents();
+  checkBackendHealth();
 } catch (error) {
   console.error(error);
   setStatus(`页面部分控件初始化失败，但文件上传仍可用：${error.message}`, "error");
