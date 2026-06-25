@@ -15,15 +15,22 @@ import random
 import socket
 import subprocess
 import tempfile
+import threading
+import time
+import uuid
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 import pandas as pd
 
 
 APP_DIR = Path(__file__).resolve().parent
+ANALYSIS_JOBS: dict[str, dict[str, Any]] = {}
+ANALYSIS_JOBS_LOCK = threading.Lock()
+JOB_TTL_SECONDS = 60 * 60
 
 DEFAULT_RECIPE: dict[str, Any] = {
     "deg": {
@@ -1036,6 +1043,87 @@ def inspect_payload(file_items: list[UploadedFile], params: dict[str, Any] | Non
     }
 
 
+def clone_uploaded_files(file_items: list[UploadedFile]) -> list[UploadedFile]:
+    cloned: list[UploadedFile] = []
+    for item in file_items:
+        item.file.seek(0)
+        cloned.append(UploadedFile(filename=item.filename, file=io.BytesIO(item.file.read())))
+    return cloned
+
+
+def cleanup_jobs() -> None:
+    cutoff = time.time() - JOB_TTL_SECONDS
+    with ANALYSIS_JOBS_LOCK:
+        expired = [
+            job_id
+            for job_id, job in ANALYSIS_JOBS.items()
+            if job.get("created_at", 0) < cutoff and job.get("status") in {"complete", "error"}
+        ]
+        for job_id in expired:
+            ANALYSIS_JOBS.pop(job_id, None)
+
+
+def start_analysis_job(file_items: list[UploadedFile], params: dict[str, Any]) -> str:
+    cleanup_jobs()
+    job_id = uuid.uuid4().hex
+    files = clone_uploaded_files(file_items)
+    with ANALYSIS_JOBS_LOCK:
+        ANALYSIS_JOBS[job_id] = {
+            "status": "queued",
+            "message": "任务已加入队列",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "result": None,
+            "error": None,
+        }
+
+    def run_job() -> None:
+        with ANALYSIS_JOBS_LOCK:
+            if job_id in ANALYSIS_JOBS:
+                ANALYSIS_JOBS[job_id]["status"] = "running"
+                ANALYSIS_JOBS[job_id]["message"] = "R/DESeq2 分析中"
+                ANALYSIS_JOBS[job_id]["updated_at"] = time.time()
+        try:
+            payload = analyze_payload(files, params)
+            with ANALYSIS_JOBS_LOCK:
+                if job_id in ANALYSIS_JOBS:
+                    ANALYSIS_JOBS[job_id]["status"] = "complete"
+                    ANALYSIS_JOBS[job_id]["message"] = "分析完成"
+                    ANALYSIS_JOBS[job_id]["result"] = payload
+                    ANALYSIS_JOBS[job_id]["updated_at"] = time.time()
+        except Exception as exc:  # pragma: no cover - user-facing guard
+            with ANALYSIS_JOBS_LOCK:
+                if job_id in ANALYSIS_JOBS:
+                    ANALYSIS_JOBS[job_id]["status"] = "error"
+                    ANALYSIS_JOBS[job_id]["message"] = str(exc)
+                    ANALYSIS_JOBS[job_id]["error"] = str(exc)
+                    ANALYSIS_JOBS[job_id]["updated_at"] = time.time()
+
+    threading.Thread(target=run_job, daemon=True).start()
+    return job_id
+
+
+def get_analysis_job(job_id: str) -> dict[str, Any] | None:
+    cleanup_jobs()
+    with ANALYSIS_JOBS_LOCK:
+        job = ANALYSIS_JOBS.get(job_id)
+        if job is None:
+            return None
+        payload = {
+            "ok": True,
+            "job_id": job_id,
+            "status": job.get("status"),
+            "message": job.get("message"),
+            "created_at": job.get("created_at"),
+            "updated_at": job.get("updated_at"),
+        }
+        if job.get("status") == "complete":
+            payload["result"] = job.get("result")
+        if job.get("status") == "error":
+            payload["error"] = job.get("error") or job.get("message")
+        return payload
+
+
 def make_demo_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     rng = random.Random(11)
     genes = [f"Gene{str(i).zfill(4)}" for i in range(1, 701)]
@@ -1142,16 +1230,28 @@ class AppHandler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:
-        if self.path == "/api/health":
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/health":
             json_response(self, {"ok": True, "service": "rnaseq-deseq-webapp"})
             return
-        if self.path == "/api/demo":
+        if parsed.path == "/api/job":
+            job_id = (parse_qs(parsed.query).get("id") or [""])[0]
+            if not job_id:
+                error_response(self, "缺少任务 ID。", 400)
+                return
+            payload = get_analysis_job(job_id)
+            if payload is None:
+                error_response(self, "找不到这个分析任务，可能已经过期。", 404)
+                return
+            json_response(self, payload)
+            return
+        if parsed.path == "/api/demo":
             try:
                 json_response(self, demo_payload())
             except Exception as exc:  # pragma: no cover - user-facing guard
                 error_response(self, str(exc), 500)
             return
-        if self.path == "/":
+        if parsed.path == "/":
             self.path = "/index.html"
         super().do_GET()
 
@@ -1171,7 +1271,7 @@ class AppHandler(SimpleHTTPRequestHandler):
                 error_response(self, str(exc), 400)
             return
 
-        if self.path not in {"/api/inspect", "/api/analyze"}:
+        if self.path not in {"/api/inspect", "/api/analyze", "/api/analyze_job"}:
             error_response(self, "Unknown endpoint.", 404)
             return
         content_type = self.headers.get("content-type", "")
@@ -1200,6 +1300,9 @@ class AppHandler(SimpleHTTPRequestHandler):
             params = json.loads(fields.get("params") or "{}")
             if self.path == "/api/inspect":
                 payload = inspect_payload(file_items, params)
+            elif self.path == "/api/analyze_job":
+                job_id = start_analysis_job(file_items, params)
+                payload = {"ok": True, "job_id": job_id, "status": "queued", "message": "分析任务已启动"}
             else:
                 payload = analyze_payload(file_items, params)
             json_response(self, payload)

@@ -722,6 +722,42 @@ async function apiPost(path, form) {
   return payload;
 }
 
+async function apiGet(path) {
+  let response;
+  try {
+    response = await fetch(apiUrl(path), { method: "GET" });
+  } catch (error) {
+    throw new Error(`无法连接后端 API。浏览器原始错误：${error.message}`);
+  }
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    const text = await response.text();
+    const shortText = text.replace(/\s+/g, " ").slice(0, 180);
+    throw new Error(`服务器没有返回可读取的数据（HTTP ${response.status}）。${shortText || "请查看云平台日志。"}`);
+  }
+  const payload = await response.json();
+  if (!payload.ok) throw new Error(payload.error || "请求失败。");
+  return payload;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForAnalysisJob(jobId) {
+  const started = Date.now();
+  const maxWaitMs = 30 * 60 * 1000;
+  while (Date.now() - started < maxWaitMs) {
+    await sleep(3000);
+    const payload = await apiGet(`/api/job?id=${encodeURIComponent(jobId)}`);
+    if (payload.status === "complete") return payload.result;
+    if (payload.status === "error") throw new Error(payload.error || payload.message || "分析失败。");
+    const seconds = Math.round((Date.now() - started) / 1000);
+    setStatus(`${payload.message || "R/DESeq2 分析中"}... ${seconds}s`);
+  }
+  throw new Error("分析等待超过 30 分钟，请查看云平台日志。");
+}
+
 function defaultBatchName() {
   return $("batchName").value.trim() || `set${state.batches.length + 1}`;
 }
@@ -996,8 +1032,10 @@ async function analyzeFiles() {
       sample_meta: currentSampleMeta(),
       analysis_recipe: state.recipe,
     };
-    setStatus("多 KO 分析中...");
-    const payload = await apiPost("/api/analyze", formDataWithBatches({ params }));
+    setStatus("分析任务启动中...");
+    const job = await apiPost("/api/analyze_job", formDataWithBatches({ params }));
+    setStatus(`任务已启动：${job.job_id.slice(0, 8)}，R/DESeq2 分析中...`);
+    const payload = await waitForAnalysisJob(job.job_id);
     renderResults(payload);
     setStatus(`完成：${payload.summary.contrasts} 个 contrast，${payload.summary.batches} 个 batch`);
   } catch (error) {
