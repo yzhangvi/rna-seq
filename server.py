@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+from email.parser import BytesParser
+from email.policy import default as email_policy
 import io
 import json
 import math
@@ -12,13 +15,9 @@ import random
 import socket
 import subprocess
 import tempfile
-import warnings
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-
-warnings.filterwarnings("ignore", message="'cgi' is deprecated.*", category=DeprecationWarning)
-import cgi
 
 import numpy as np
 import pandas as pd
@@ -52,6 +51,12 @@ DEFAULT_RECIPE: dict[str, Any] = {
         "max_terms": 80,
     },
 }
+
+
+@dataclass
+class UploadedFile:
+    filename: str
+    file: io.BytesIO
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -238,7 +243,7 @@ def clean_header(value: Any) -> str:
     return text if text and text.lower() != "nan" else "Unnamed"
 
 
-def read_uploaded_table(file_item: cgi.FieldStorage) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, dict[str, Any]]:
+def read_uploaded_table(file_item: UploadedFile) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, dict[str, Any]]:
     filename = (file_item.filename or "").lower()
     content = file_item.file.read()
     if not content:
@@ -311,12 +316,33 @@ def infer_metadata(metadata: pd.DataFrame | None, sample_cols: list[str]) -> dic
     return {"rows": rows, "conditions": conditions}
 
 
-def get_file_items(form: cgi.FieldStorage) -> list[cgi.FieldStorage]:
-    if "file" not in form:
-        return []
-    item = form["file"]
-    items = item if isinstance(item, list) else [item]
-    return [entry for entry in items if getattr(entry, "filename", None)]
+def parse_multipart_form(headers: Any, body: bytes) -> tuple[list[UploadedFile], dict[str, str]]:
+    content_type = headers.get("content-type", "")
+    raw_message = (
+        f"Content-Type: {content_type}\r\n"
+        "MIME-Version: 1.0\r\n"
+        "\r\n"
+    ).encode("utf-8") + body
+    message = BytesParser(policy=email_policy).parsebytes(raw_message)
+    if not message.is_multipart():
+        raise ValueError("请使用表单上传文件。")
+
+    files: list[UploadedFile] = []
+    fields: dict[str, str] = {}
+    for part in message.iter_parts():
+        if part.get_content_disposition() != "form-data":
+            continue
+        name = part.get_param("name", header="content-disposition")
+        if not name:
+            continue
+        payload = part.get_payload(decode=True) or b""
+        filename = part.get_filename()
+        if filename:
+            files.append(UploadedFile(filename=filename, file=io.BytesIO(payload)))
+        else:
+            charset = part.get_content_charset() or "utf-8"
+            fields[name] = payload.decode(charset, errors="replace")
+    return files, fields
 
 
 def infer_group_from_sample(sample: str) -> str:
@@ -352,7 +378,7 @@ def unique_sample_name(name: str, batch: str, used: set[str]) -> str:
 
 
 def prepare_uploaded_dataset(
-    file_items: list[cgi.FieldStorage],
+    file_items: list[UploadedFile],
     batch_overrides: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if not file_items:
@@ -917,7 +943,7 @@ def run_r_deseq_pipeline(
         return json.loads(output_path.read_text(encoding="utf-8"))
 
 
-def analyze_payload(file_items: list[cgi.FieldStorage], params: dict[str, Any]) -> dict[str, Any]:
+def analyze_payload(file_items: list[UploadedFile], params: dict[str, Any]) -> dict[str, Any]:
     recipe = parse_recipe(params)
     dataset = prepare_uploaded_dataset(file_items, params.get("batch_overrides") or [])
     counts = dataset["counts"]
@@ -977,7 +1003,7 @@ def analyze_payload(file_items: list[cgi.FieldStorage], params: dict[str, Any]) 
     return payload
 
 
-def inspect_payload(file_items: list[cgi.FieldStorage], params: dict[str, Any] | None = None) -> dict[str, Any]:
+def inspect_payload(file_items: list[UploadedFile], params: dict[str, Any] | None = None) -> dict[str, Any]:
     params = params or {}
     dataset = prepare_uploaded_dataset(file_items, params.get("batch_overrides") or [])
     counts = dataset["counts"]
@@ -1134,18 +1160,30 @@ class AppHandler(SimpleHTTPRequestHandler):
         if self.path not in {"/api/inspect", "/api/analyze"}:
             error_response(self, "Unknown endpoint.", 404)
             return
-        ctype, pdict = cgi.parse_header(self.headers.get("content-type", ""))
-        if ctype != "multipart/form-data":
+        content_type = self.headers.get("content-type", "")
+        if "multipart/form-data" not in content_type:
             error_response(self, "请使用表单上传文件。")
             return
-        pdict["boundary"] = bytes(pdict["boundary"], "utf-8")
-        form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
-        file_items = get_file_items(form)
+        length = int(self.headers.get("content-length", "0") or "0")
+        max_upload_mb = int(os.environ.get("MAX_UPLOAD_MB", "200"))
+        max_upload_bytes = max_upload_mb * 1024 * 1024
+        if length <= 0:
+            error_response(self, "没有收到上传内容。")
+            return
+        if length > max_upload_bytes:
+            error_response(self, f"上传内容超过 {max_upload_mb} MB，请减少文件数量或调高服务器 MAX_UPLOAD_MB。", 413)
+            return
+        body = self.rfile.read(length)
+        try:
+            file_items, fields = parse_multipart_form(self.headers, body)
+        except Exception as exc:
+            error_response(self, f"上传表单解析失败：{exc}", 400)
+            return
         if not file_items:
             error_response(self, "请选择一个或多个数据文件。")
             return
         try:
-            params = json.loads(form.getvalue("params") or "{}")
+            params = json.loads(fields.get("params") or "{}")
             if self.path == "/api/inspect":
                 payload = inspect_payload(file_items, params)
             else:

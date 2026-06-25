@@ -697,6 +697,12 @@ function formDataWithBatches(extra = {}) {
 
 async function apiPost(path, form) {
   const response = await fetch(path, { method: "POST", body: form });
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    const text = await response.text();
+    const shortText = text.replace(/\s+/g, " ").slice(0, 180);
+    throw new Error(`服务器没有返回可读取的数据（HTTP ${response.status}）。${shortText || "请查看云平台日志。"}`);
+  }
   const payload = await response.json();
   if (!payload.ok) throw new Error(payload.error || "请求失败。");
   return payload;
