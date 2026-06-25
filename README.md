@@ -1,3 +1,12 @@
+---
+title: RNA-seq DESeq2 Web App
+colorFrom: green
+colorTo: blue
+sdk: docker
+app_port: 8788
+pinned: false
+---
+
 # RNA-seq Raw Counts Web App
 
 ## 公网开放应用
